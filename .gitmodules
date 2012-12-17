@@ -1,0 +1,3 @@
+[submodule "ClojureClrEx"]
+	path = ClojureClrEx
+	url = https://github.com/aaronc/ClojureClrEx
