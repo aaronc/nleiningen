@@ -70,7 +70,6 @@
 (defn configure-load-path [src-paths]
   (str/join ";" src-paths))
 
-;(def ^:dynamic *project-root* "c:\\users\\aaron\\dev\\tsunami5\\apps\\pharmaseqcommon\\clojureclrex")
 (def ^:dynamic *project-root* "c:\\users\\aaron\\dev\\nleiningen")
 
 (def ^:dynamic *project* (atom nil))
