@@ -37,7 +37,8 @@
   (let [asmrefs (flatten
                  (map #(seq (.AssemblyReferences %))
                       (.. pack-man LocalRepository GetPackages)))]
-    (filter (fn [asmref] some #(= target-framework %) (.SupportedFrameworks asmref)) asmrefs)))
+    (filter #(and (= (.Version target-framework) (.Version (.TargetFramework %)))
+                  (#{"" "Client"} (.Profile (.TargetFramework %)))) asmrefs)))
 
 (defn add-to-bin-path [path]
   (let [bin-path (.. (AppDomain/CurrentDomain) SetupInformation PrivateBinPath)]
@@ -53,7 +54,7 @@
     (.CopyTo stream mem)
     (.ToArray mem)))
 
-(defn- clj-init-type-name [asm-name] (str (clojure.lang.Compiler/munge asm-name) "__$Clj$Init$__"))
+;;(defn- clj-init-type-name [asm-name] (str (clojure.lang.Compiler/munge asm-name) "__$Clj$Init$__"))
 (def ^:private ^:const clj-init-type-name "__$Clj$Init$__")
 
 (defn invoke-asm-load-hooks [asm]
@@ -69,7 +70,9 @@
   (doseq [asmref (get-dependency-assembly-references)]
     (let [src-path (.SourcePath asmref)
           asm-name (AssemblyName/GetAssemblyName src-path)
-          asm (or (Assembly/Load (.Name asm-name)) (assembly-load-file src-path))]
+          asm (or (try (Assembly/Load (.Name asm-name))
+                       (catch Exception ex))
+                  (assembly-load-file src-path))]
       (when asm
         (invoke-asm-load-hooks asm)
         (swap! *project* assoc-in [:computed-dependencies (Path/GetFileName src-path)] {:path src-path :asm asm :asm-name asm-name})
