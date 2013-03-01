@@ -238,11 +238,12 @@
 (defn compile-project [& {:keys [clojure-dll]}]
   (bootstrap-project)
   (println "Compile path:" *compile-path*)
-  (let [{:keys [name source-paths computed-dependencies gac-dependencies main target] :as proj} @*project*
+  (let [{:keys [name source-paths computed-dependencies gac-dependencies main target version] :as proj} @*project*
         clj-asm (or clojure-dll (assembly-load "Clojure"))
         gen-context-type (.GetType clj-asm "clojure.lang.CljCompiler.Ast.GenContext")
         files (flatten (for [path source-paths] (get-clj-files path)))
         ext (get-target-ext target)
+        asm-name (str name ", Version=" version)
         ;; create-with-ext-asm-method
         ;; (.GetMethod gen-context-type "CreateWithExternalAssembly"
         ;;             (emit/type-array String String Boolean))
@@ -254,7 +255,7 @@
         ;;                            (emit/type-array gen-context-type TextReader
         ;;                                             String String
         ;;                                             String))
-        gen-ctxt (GenContext/CreateWithExternalAssembly name ext true)]
+        gen-ctxt (GenContext/CreateWithExternalAssembly asm-name ext true)]
     (when (not (Directory/Exists *compile-path*))
       (println "Creating" *compile-path*)
       (Directory/CreateDirectory *compile-path*))
