@@ -1,4 +1,4 @@
-(ns nleingingen.signing
+(ns nleiningen.signing
   (:import [System.Reflection StrongNameKeyPair]
            [System.IO File FileMode]
            [Mono.Cecil AssemblyDefinition WriterParameters]))

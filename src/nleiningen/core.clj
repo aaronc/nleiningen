@@ -4,7 +4,7 @@
   (:require
    [clojure.string :as str]
    [clojure.clr.emit :as emit]
-   [nleingingen.signing :as sign])
+   [nleiningen.signing :as sign])
   (:import
    [System.IO Path Directory SearchOption DirectoryInfo StreamReader File TextReader]
    [System.Reflection Assembly BindingFlags AssemblyName]
@@ -37,7 +37,7 @@
   (let [asmrefs (flatten
                  (map #(seq (.AssemblyReferences %))
                       (.. pack-man LocalRepository GetPackages)))]
-    (filter #(.Equals target-framework (.TargetFramework %)) asmrefs)))
+    (filter (fn [asmref] some #(= target-framework %) (.SupportedFrameworks asmref)) asmrefs)))
 
 (defn add-to-bin-path [path]
   (let [bin-path (.. (AppDomain/CurrentDomain) SetupInformation PrivateBinPath)]
@@ -53,6 +53,7 @@
     (.CopyTo stream mem)
     (.ToArray mem)))
 
+(defn- clj-init-type-name [asm-name] (str (clojure.lang.Compiler/munge asm-name) "__$Clj$Init$__"))
 (def ^:private ^:const clj-init-type-name "__$Clj$Init$__")
 
 (defn invoke-asm-load-hooks [asm]
@@ -60,19 +61,22 @@
     (let [init-method (.GetMethod init-type "Init")]
       (.Invoke init-method nil))))
 
+(def ^:dynamic *project-root* nil)
+
+(def ^:dynamic *project* (atom nil))
+
 (defn load-dependencies []
   (doseq [asmref (get-dependency-assembly-references)]
-    (println (.EffectivePath asmref))
-    (when-let [asm (System.Reflection.Assembly/Load (read-bytes (.GetStream asmref)))]
-      (invoke-asm-load-hooks asm)
-      (println "Loaded" asm))))
+    (let [src-path (.SourcePath asmref)
+          asm-name (AssemblyName/GetAssemblyName src-path)
+          asm (or (Assembly/Load (.Name asm-name)) (assembly-load-file src-path))]
+      (when asm
+        (invoke-asm-load-hooks asm)
+        (swap! *project* assoc-in [:computed-dependencies (Path/GetFileName src-path)] {:path src-path :asm asm :asm-name asm-name})
+        (println "Loaded" asm)))))
 
 (defn configure-load-path [src-paths]
   (str/join ";" src-paths))
-
-(def ^:dynamic *project-root* "c:\\users\\aaron\\dev\\nleiningen")
-
-(def ^:dynamic *project* (atom nil))
 
 (defn process-project-map [proj]
   (comment (let [{:keys
@@ -113,17 +117,17 @@
       (println "project.clj not found"))))
 
 (defn load-dependency [path]
-  (let [filename (Path/GetFileName path)]
+  (let [filename (Path/GetFileName path)
+        asm (assembly-load-file path)]
     (println "Loading" path)
-    (swap! *project* assoc-in [:computed-dependencies filename] path)
-    (assembly-load-file path)))
+    (swap! *project* assoc-in [:computed-dependencies filename] {:path path :asm asm :asm-name (.GetName asm)})))
 
 (declare compile-project)
 
 (defn get-target-ext [target]
   (if (or (= target :console)
-                          (= target :windows))
-              ".exe" ".dll"))
+          (= target :windows))
+    ".exe" ".dll"))
 
 (defn get-compiled-target-name []
     (let [{:keys [name target] :as proj} @*project*
@@ -209,6 +213,25 @@
    (Path/GetFullPath path2)
    StringComparison/InvariantCultureIgnoreCase))
 
+(defn copy-assembly-references [asm-name copied]
+  (try
+    (when-not (contains? @copied asm-name)
+      (when-let [asm (find-app-domain-assembly asm-name)]
+        (when-not (.GlobalAssemblyCache asm)
+          (let [path (.Location asm)
+                name (.Name asm-name)]
+            (when-not (String/IsNullOrEmpty path)
+              (let [asm-file (Path/GetFileName path)
+                    new-path (Path/Combine *compile-path* asm-file)]
+                (when-not (paths-equal path new-path)
+                  (File/Copy path new-path true)
+                  (swap! copied conj asm-name)
+                  (doseq [refed-asm (.GetReferencedAssemblies asm)]
+                    (copy-assembly-references refed-asm copied))
+                  asm-file)))))))
+    (catch Exception ex
+      (println "Error while trying to copy" asm-name "." ex))))
+
 (defn compile-project [& {:keys [clojure-dll]}]
   (bootstrap-project)
   (println "Compile path:" *compile-path*)
@@ -248,14 +271,16 @@
           (op :Ldstr asm-name)
           (op :Call asm-load-method)
           (op :Pop))
-        (doseq [[name path] computed-dependencies]
+        (doseq [[name {:keys [path asm asm-name]}] computed-dependencies]
           (println "Computed dependency:" path)
-          (let [asm (assembly-load-file path)
-                init (when asm (.GetType asm clj-init-type-name))]
-            (when init
-              (println init)
+          (let [init (when asm (.GetType asm clj-init-type-name))]
+            (if init
               (let [init-method (.GetMethod init "Init")]
-                (op :Call init-method)))))
+                (op :Call init-method))
+              (do
+                (op :Ldstr (.Name asm-name))
+                (op :Call asm-load-method)
+                (op :Pop)))))
         (op :Ret))
       (let [init-type (.CreateType clj-init-type)]
         (when main
@@ -321,35 +346,24 @@
                               (case target
                                 :console PEFileKinds/ConsoleApplication
                                 :windows PEFileKinds/WindowApplication
-                                :default PEFileKinds/Dll)))))
+                                PEFileKinds/Dll)))))
         (println "Saving" (str name ext))
         (.Invoke (.GetMethod GenContext "SaveAssembly" (enum-or BindingFlags/Instance BindingFlags/NonPublic)) gen-ctxt nil)
-        (let [copied-deps
-              (for [[name path] computed-dependencies]
-                (let [new-path (Path/Combine *compile-path* name)]
-                  (when-not (paths-equal path new-path)
-                    (File/Copy path new-path true)
-                    name)))
-              asm-builder (.. gen-ctxt AssemblyGen AssemblyBuilder)
-              copied-refs
-              (for [asm-name (.GetReferencedAssemblies asm-builder)]
-                (try
-                  (when-let [asm (find-app-domain-assembly asm-name)]
-                    (when-not (.GlobalAssemblyCache asm)
-                      (let [path (.Location asm)
-                            name (.Name asm-name)]
-                        (when-not (String/IsNullOrEmpty path)
-                          (let [asm-file (Path/GetFileName path)
-                                new-path (Path/Combine *compile-path* asm-file)]
-                            (when-not (paths-equal path new-path)
-                              (File/Copy path new-path true)
-                              asm-file))))))
-                  (catch Exception ex
-                    (println "Error while trying to copy" asm-name "." ex))))
-              copied-refs (concat copied-deps copied-refs)
-              copied-refs (remove nil? copied-refs)]
-          (when-not (empty? copied-refs)
-            (println "Copied" (str/join ", " (remove nil? copied-refs)) "to output directory")))))
+        (let [copied-refs (atom #{})
+              asm-builder (.. gen-ctxt AssemblyGen AssemblyBuilder)]
+          (doseq [[name {:keys [path asm asm-name]}] computed-dependencies]
+            (when-not (contains? @copied-refs asm-name)
+              (let [new-path (Path/Combine *compile-path* name)]
+                (when-not (paths-equal path new-path)
+                  (File/Copy path new-path true)
+                  (swap! copied-refs conj asm-name)
+                  (doseq [refasm (.GetReferencedAssemblies asm)]
+                    (copy-assembly-references asm-name copied-refs))
+                  name))))
+          (doseq [asm-name (.GetReferencedAssemblies asm-builder)]
+            (copy-assembly-references asm-name copied-refs))
+          (when-not (empty? @copied-refs)
+            (println "Copied" (str/join ", " (map #(.Name %) @copied-refs)) "to output directory")))))
      ; Output file name
     ))
 
@@ -368,8 +382,17 @@
 (defn rep [{:keys [proxy]} obj]
   (.ReadEvalPrint proxy obj))
 
+(defn print-help []
+  (println "nleiningen is a tool for working with ClojureCLR projects.")
+  (println)
+  (println "Available tasks are:")
+  (println "compile\tCompile Clojure source files into a CLR assembly")
+  (println "repl\tStart a repl"))
+
 (defn args-error [args]
-  (println "Don't know how to handle" args))
+  (if (empty? args)
+    (print-help)
+    (println "Don't know how to execute" args)))
 
 (defn start-repl [args]
   (require 'clojure.main)
@@ -377,16 +400,21 @@
   (apply clojure.main/main args))
 
 (defn main [& args]
-  (binding [*project-root* (Directory/GetCurrentDirectory)
-            *project* (atom nil)
-            *compile-path* nil]
-    (when (load-project)
-      (let [nargs (count args)]
-        (cond
-         (= 0 args)
-         (println "NLeiningen Preview. Tasks: repl, compile")
-         :default
-         (case (first args)
-           "repl" (start-repl (rest args))
-           "compile" (compile-project)
-           (args-error args)))))))
+  (try
+    (binding [*project-root* (or *project-root* (Directory/GetCurrentDirectory))
+              *project* (atom nil)
+              *compile-path* nil]
+      (when (load-project)
+        (let [nargs (count args)]
+          (cond
+           (= 0 args)
+           (println "NLeiningen Preview. Tasks: repl, compile")
+           :default
+           (case (first args)
+             "repl" (start-repl (rest args))
+             "compile" (compile-project)
+             (args-error args)))))
+      0)
+    (catch Exception ex
+               (println "Error: " ex)
+               -1)))

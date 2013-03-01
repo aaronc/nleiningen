@@ -1,0 +1,4 @@
+packages/
+*.suo
+_ReSharper*
+*.user
