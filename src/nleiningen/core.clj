@@ -4,7 +4,7 @@
   (:require
    [clojure.string :as str]
    [clojure.clr.emit :as emit]
-   [nleiningen.signing :as sign])
+   [nleiningen.signing :as signing])
   (:import
    [System.IO Path Directory SearchOption DirectoryInfo StreamReader File TextReader]
    [System.Reflection Assembly BindingFlags AssemblyName]
@@ -238,12 +238,12 @@
 (defn compile-project [& {:keys [clojure-dll]}]
   (bootstrap-project)
   (println "Compile path:" *compile-path*)
-  (let [{:keys [name source-paths computed-dependencies gac-dependencies main target version] :as proj} @*project*
+  (let [{:keys [name source-paths computed-dependencies gac-dependencies main target version key-file] :as proj} @*project*
         clj-asm (or clojure-dll (assembly-load "Clojure"))
         gen-context-type (.GetType clj-asm "clojure.lang.CljCompiler.Ast.GenContext")
         files (flatten (for [path source-paths] (get-clj-files path)))
         ext (get-target-ext target)
-        asm-name (str name ", Version=" version)
+        asm-name (AssemblyName. (str name ", Version=" version))
         ;; create-with-ext-asm-method
         ;; (.GetMethod gen-context-type "CreateWithExternalAssembly"
         ;;             (emit/type-array String String Boolean))
@@ -255,119 +255,125 @@
         ;;                            (emit/type-array gen-context-type TextReader
         ;;                                             String String
         ;;                                             String))
-        gen-ctxt (GenContext/CreateWithExternalAssembly asm-name ext true)]
-    (when (not (Directory/Exists *compile-path*))
-      (println "Creating" *compile-path*)
-      (Directory/CreateDirectory *compile-path*))
-    (doseq [{:keys [rel-path path name]} files]
-      (with-open [rdr (StreamReader. path)]
-        (clojure.lang.Compiler/Compile gen-ctxt rdr nil name
-                                        rel-path)
-        ;;(.Invoke compile-method nil (emit/obj-array gen-ctxt rdr nil
-        ;name rel-path))
-        ))
-    (let [clj-init-type (emit/clr-type* gen-ctxt clj-init-type-name)
-          clj-init (emit/clr-method* clj-init-type "Init" [:Public :Static] nil nil)
-          ilg (.GetILGenerator clj-init)
-          asm-load-method (.GetMethod Assembly "Load" (emit/type-array String))]
-      (binding [emit/*ilgen* ilg]
-        (doseq [asm-name gac-dependencies]
-          (op :Ldstr asm-name)
-          (op :Call asm-load-method)
-          (op :Pop))
-        (doseq [[name {:keys [path asm asm-name]}] computed-dependencies]
-          (println "Computed dependency:" path)
-          (let [init (when asm (.GetType asm clj-init-type-name))]
-            (if init
-              (let [init-method (.GetMethod init "Init")]
-                (op :Call init-method))
-              (do
-                (op :Ldstr (.Name asm-name))
-                (op :Call asm-load-method)
-                (op :Pop)))))
-        (op :Ret))
-      (let [init-type (.CreateType clj-init-type)]
-        (when main
-          (let [init-method (.GetMethod init-type "Init")
-                program-type (emit/clr-type* gen-ctxt "Program")
-                main-method (emit/clr-method*
-                             program-type
-                             "Main" [:Public :Static] nil
-                             [|System.String[]|])
-                ilg (.GetILGenerator main-method)
-                main-sym (symbol main)
-                main-ns (.Namespace main-sym)
-                main-name (.Name main-sym)
-                write-line-method (.GetMethod Console "WriteLine" (emit/make-typed-array Type [String]))
-                to-string-method (.GetMethod Object "ToString")
-                rt-type (.GetType clj-asm "clojure.lang.RT")
-                var-method (.GetMethod rt-type "var"
-                                       (emit/make-typed-array Type [String String]))
-                seq-method (.GetMethod rt-type "seq")
-                var-type (.GetType clj-asm "clojure.lang.Var")
-                invoke-method (.GetMethod var-type "invoke"
-                                          (emit/make-typed-array Type [Object]))
-                applyTo-method (.GetMethod var-type "applyTo")
-                symbol-type (.GetType clj-asm "clojure.lang.Symbol")
-                intern-method (.GetMethod symbol-type "intern"
-                                          (emit/make-typed-array Type [String]))]
-            (binding [emit/*ilgen* ilg]
-              ;; Invoke __$Clj$Init$__.Init
-              (op :Call init-method)
-
-              ;; Call RT.var("clojure.core", "require")
-              (op :Ldstr "clojure.core")
-              (op :Ldstr "require")
-              (op :Call var-method) ; 
-
-              ;; Call Symbol.intern(main-ns)
-              (op :Ldstr main-ns)
-              (op :Call intern-method) ; 
-
-              ;; Call invoke method of clojure.core/require var
-              ;; on main-ns symbol
-              (op :Callvirt invoke-method)
-              (op :Pop)
-
-              ;; Call RT.var(main-ns, main-name)
-              (op :Ldstr main-ns)
-              (op :Ldstr main-name)
-              (op :Call var-method) 
-              
-              ;; Call RT.seq on first argument
-              (op :Ldarg_0)
-              (op :Call seq-method) ; 
-
-              ;; Call applyTo method of main function on args
-              (op :Callvirt applyTo-method)
-              (op :Pop)
-
-              ;; Return
-              (op :Ret)
-              (.CreateType program-type)
-              (.SetEntryPoint (.. gen-ctxt AssemblyGen AssemblyBuilder)
-                              main-method
-                              (case target
-                                :console PEFileKinds/ConsoleApplication
-                                :windows PEFileKinds/WindowApplication
-                                PEFileKinds/Dll)))))
-        (println "Saving" (str name ext))
-        (.Invoke (.GetMethod GenContext "SaveAssembly" (enum-or BindingFlags/Instance BindingFlags/NonPublic)) gen-ctxt nil)
-        (let [copied-refs (atom #{})
-              asm-builder (.. gen-ctxt AssemblyGen AssemblyBuilder)]
+        ]
+    (when key-file
+      (set! (.KeyPair asm-name) (signing/create-strong-name-key-pair key-file)))
+    (let [gen-ctxt (GenContext/CreateWithExternalAssembly (.Name asm-name) asm-name ext true)]
+      (when (not (Directory/Exists *compile-path*))
+        (println "Creating" *compile-path*)
+        (Directory/CreateDirectory *compile-path*))
+      
+      (doseq [{:keys [rel-path path name]} files]
+        (assert (.EndsWith rel-path ".clj"))
+        (clojure.lang.RT/load  (.Substring rel-path 0 (- (.Length rel-path) 4)))
+        (with-open [rdr (StreamReader. path)]
+          (clojure.lang.Compiler/Compile gen-ctxt rdr nil name
+                                         rel-path)
+          ;;(.Invoke compile-method nil (emit/obj-array gen-ctxt rdr nil
+                                        ;name rel-path))
+          ))
+      (let [clj-init-type (emit/clr-type* gen-ctxt clj-init-type-name)
+            clj-init (emit/clr-method* clj-init-type "Init" [:Public :Static] nil nil)
+            ilg (.GetILGenerator clj-init)
+            asm-load-method (.GetMethod Assembly "Load" (emit/type-array String))]
+        (binding [emit/*ilgen* ilg]
+          (doseq [asm-name gac-dependencies]
+            (op :Ldstr asm-name)
+            (op :Call asm-load-method)
+            (op :Pop))
           (doseq [[name {:keys [path asm asm-name]}] computed-dependencies]
-            (when-not (contains? @copied-refs asm-name)
-              (let [new-path (Path/Combine *compile-path* name)]
-                (when-not (paths-equal path new-path)
-                  (File/Copy path new-path true)
-                  (swap! copied-refs conj asm-name)
-                  (doseq [refasm (.GetReferencedAssemblies asm)]
-                    (copy-assembly-references asm-name copied-refs))
-                  name))))
-          (doseq [asm-name (.GetReferencedAssemblies asm-builder)]
-            (copy-assembly-references asm-name copied-refs))
-          (when-not (empty? @copied-refs)
-            (println "Copied" (str/join ", " (map #(.Name %) @copied-refs)) "to output directory")))))
+            (println "Computed dependency:" path)
+            (let [init (when asm (.GetType asm clj-init-type-name))]
+              (if init
+                (let [init-method (.GetMethod init "Init")]
+                  (op :Call init-method))
+                (do
+                  (op :Ldstr (.Name asm-name))
+                  (op :Call asm-load-method)
+                  (op :Pop)))))
+          (op :Ret))
+        (let [init-type (.CreateType clj-init-type)]
+          (when main
+            (let [init-method (.GetMethod init-type "Init")
+                  program-type (emit/clr-type* gen-ctxt "Program")
+                  main-method (emit/clr-method*
+                               program-type
+                               "Main" [:Public :Static] nil
+                               [|System.String[]|])
+                  ilg (.GetILGenerator main-method)
+                  main-sym (symbol main)
+                  main-ns (.Namespace main-sym)
+                  main-name (.Name main-sym)
+                  write-line-method (.GetMethod Console "WriteLine" (emit/make-typed-array Type [String]))
+                  to-string-method (.GetMethod Object "ToString")
+                  rt-type (.GetType clj-asm "clojure.lang.RT")
+                  var-method (.GetMethod rt-type "var"
+                                         (emit/make-typed-array Type [String String]))
+                  seq-method (.GetMethod rt-type "seq")
+                  var-type (.GetType clj-asm "clojure.lang.Var")
+                  invoke-method (.GetMethod var-type "invoke"
+                                            (emit/make-typed-array Type [Object]))
+                  applyTo-method (.GetMethod var-type "applyTo")
+                  symbol-type (.GetType clj-asm "clojure.lang.Symbol")
+                  intern-method (.GetMethod symbol-type "intern"
+                                            (emit/make-typed-array Type [String]))]
+              (binding [emit/*ilgen* ilg]
+                ;; Invoke __$Clj$Init$__.Init
+                (op :Call init-method)
+
+                ;; Call RT.var("clojure.core", "require")
+                (op :Ldstr "clojure.core")
+                (op :Ldstr "require")
+                (op :Call var-method) ; 
+
+                ;; Call Symbol.intern(main-ns)
+                (op :Ldstr main-ns)
+                (op :Call intern-method) ; 
+
+                ;; Call invoke method of clojure.core/require var
+                ;; on main-ns symbol
+                (op :Callvirt invoke-method)
+                (op :Pop)
+
+                ;; Call RT.var(main-ns, main-name)
+                (op :Ldstr main-ns)
+                (op :Ldstr main-name)
+                (op :Call var-method) 
+                
+                ;; Call RT.seq on first argument
+                (op :Ldarg_0)
+                (op :Call seq-method) ; 
+
+                ;; Call applyTo method of main function on args
+                (op :Callvirt applyTo-method)
+                (op :Pop)
+
+                ;; Return
+                (op :Ret)
+                (.CreateType program-type)
+                (.SetEntryPoint (.. gen-ctxt AssemblyGen AssemblyBuilder)
+                                main-method
+                                (case target
+                                  :console PEFileKinds/ConsoleApplication
+                                  :windows PEFileKinds/WindowApplication
+                                  PEFileKinds/Dll)))))
+          (println "Saving" (str name ext))
+          (.Invoke (.GetMethod GenContext "SaveAssembly" (enum-or BindingFlags/Instance BindingFlags/NonPublic)) gen-ctxt nil)
+          (let [copied-refs (atom #{})
+                asm-builder (.. gen-ctxt AssemblyGen AssemblyBuilder)]
+            (doseq [[name {:keys [path asm asm-name]}] computed-dependencies]
+              (when-not (contains? @copied-refs asm-name)
+                (let [new-path (Path/Combine *compile-path* name)]
+                  (when-not (paths-equal path new-path)
+                    (File/Copy path new-path true)
+                    (swap! copied-refs conj asm-name)
+                    (doseq [refasm (.GetReferencedAssemblies asm)]
+                      (copy-assembly-references asm-name copied-refs))
+                    name))))
+            (doseq [asm-name (.GetReferencedAssemblies asm-builder)]
+              (copy-assembly-references asm-name copied-refs))
+            (when-not (empty? @copied-refs)
+              (println "Copied" (str/join ", " (map #(.Name %) @copied-refs)) "to output directory"))))))
      ; Output file name
     ))
 

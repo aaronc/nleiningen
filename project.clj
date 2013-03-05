@@ -4,5 +4,4 @@
   :local-dependencies
   ["ClojureClrEx"]
  :main "nleiningen.core/main"
- :key-file "%CLOJURE_SNK%"
  :target :console }
