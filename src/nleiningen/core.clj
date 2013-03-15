@@ -9,21 +9,62 @@
    [System.IO Path Directory SearchOption DirectoryInfo StreamReader File TextReader]
    [System.Reflection Assembly BindingFlags AssemblyName]
    [System.Reflection.Emit OpCodes PEFileKinds]
-   [NuGet PackageRepositoryFactory SemanticVersion PackageManager]
-   [clojure.lang.CljCompiler.Ast GenContext]))
+   [NuGet PackageRepositoryFactory SemanticVersion PackageManager
+    PackageOperationEventArgs]
+   [clojure.lang.CljCompiler.Ast GenContext]
+   [|System.EventHandler`1[NuGet.PackageOperationEventArgs]|]))
 
-(def repo (.CreateRepository (PackageRepositoryFactory/Default) "http://go.microsoft.com/fwlink/?LinkID=206669"))
+(def repo-path "packages")
 
-(defn repo-path [] "packages")
+(def ^:dynamic *project* (atom nil))
 
-(def pack-man (PackageManager. repo (repo-path)))
+(defn on-package-installed [s e]
+  (let [pkg (.Package e)]
+    (println "Package" pkg "installed")
+    (swap! *project* update-in [:packages] conj pkg)))
+
+(defn create-nuget-repo [url]
+  (let [repo (.CreateRepository (PackageRepositoryFactory/Default) url)
+        pack-man (PackageManager. repo repo-path)]
+    (.add_PackageInstalled pack-man
+                           (gen-delegate
+                            |System.EventHandler`1[NuGet.PackageOperationEventArgs]|
+                            [s e] (on-package-installed s e)))
+    {:repo repo
+     :pack-man pack-man}))
+
+(def nuget-repo (create-nuget-repo "http://go.microsoft.com/fwlink/?LinkID=206669"))
+
+(def clj-clr-myget-repo (create-nuget-repo "http://www.myget.org/F/clojure-clr/"))
+
+(defn repo-install-package [{:keys [pack-man repo]} id ver & {:keys [throw?]}]
+  [id ver]
+  (let [ver (when ver (SemanticVersion. ver))]
+    (try
+      (if ver
+        (.InstallPackage pack-man id ver)
+        (.InstallPackage pack-man id))
+      (let [pkgs (filter (fn package-filter [pkg]
+                          (and (= (.Id pkg) id)
+                               (>= (.CompareTo (.Version pkg) ver) 0)))
+                         (.. pack-man LocalRepository GetPackages))
+            pkg (last (sort (fn pkg-sort [a b]
+                              (.CompareTo (.Version a) (.Version b))) pkgs))]
+        (swap! *project* update-in [:packages] conj pkg)
+        (println "Found package" id (str (.Version pkg)) "in repository:" (.Source repo)))
+      true
+      (catch Exception ex
+        (println (str "Unable to find package " id (when ver ver) " in repository: " (.Source repo)))
+        (when throw? (throw ex))
+        false))))
 
 (defn install-package
-  ([name] (.InstallPackage pack-man name))
-  ([name ver] (.InstallPackage pack-man name (SemanticVersion. ver))))
-
-(defn show-packages []
-  (seq (.. pack-man LocalRepository GetPackages)))
+  ([name]
+     (install-package name nil))
+  ([name ver]
+     (or
+      (repo-install-package clj-clr-myget-repo name ver)
+      (repo-install-package nuget-repo name ver :throw? true))))
 
 (def target-framework (System.Runtime.Versioning.FrameworkName. ".NETFramework,Version=v4.0"))
 
@@ -33,12 +74,20 @@
           dep (cons name (rest dep))])
     (apply install-package dep)))
 
+(defn- target-framework-filter [asmref]
+  (if-let [asmref-framework (.TargetFramework asmref)]
+    (and (= (.Version target-framework) (.Version asmref-framework))
+         (#{"" "Client"} (.Profile asmref-framework)))
+    true))
+
+(defn get-project-packages []
+  (seq (:packages @*project*)))
+
 (defn get-dependency-assembly-references []
   (let [asmrefs (flatten
                  (map #(seq (.AssemblyReferences %))
-                      (.. pack-man LocalRepository GetPackages)))]
-    (filter #(and (= (.Version target-framework) (.Version (.TargetFramework %)))
-                  (#{"" "Client"} (.Profile (.TargetFramework %)))) asmrefs)))
+                      (get-project-packages)))]
+    (filter target-framework-filter asmrefs)))
 
 (defn add-to-bin-path [path]
   (let [bin-path (.. (AppDomain/CurrentDomain) SetupInformation PrivateBinPath)]
@@ -46,7 +95,7 @@
           (str ";" path))))
 
 (defn get-package-info []
-  (for [package (.. pack-man LocalRepository GetPackages)]
+  (for [package (get-project-packages)]
     {:id (.Id package)}))
 
 (defn read-bytes [stream]
@@ -60,11 +109,9 @@
 (defn invoke-asm-load-hooks [asm]
   (when-let [init-type (.GetType asm clj-init-type-name)]
     (let [init-method (.GetMethod init-type "Init")]
-      (.Invoke init-method nil))))
+      (.Invoke init-method nil nil))))
 
 (def ^:dynamic *project-root* nil)
-
-(def ^:dynamic *project* (atom nil))
 
 (defn load-dependencies []
   (doseq [asmref (get-dependency-assembly-references)]
@@ -94,7 +141,8 @@
               {:source-paths ["src"]
                :target-path "bin"
                :target :dll
-               :computed-dependencies {}}
+               :computed-dependencies {}
+               :packages #{}}
               proj)]
     proj))
 
@@ -110,14 +158,19 @@
       *project-root* path)
      path)))
 
+(defn read-project-file [proj-file]
+  (when (File/Exists proj-file)
+    (let [src (File/ReadAllText proj-file)
+          proj (process-project-map (eval (read-string src)))]
+      (set! *compile-path* (Path/Combine *project-root* (:target-path proj)))
+      (reset! *project* proj)
+      true)))
+
 (defn load-project []
-  (let [proj-file (Path/Combine *project-root* "project.clj")]
-    (if (File/Exists proj-file)
-      (let [src (File/ReadAllText proj-file)
-            proj (process-project-map (eval (read-string src)))]
-        (set! *compile-path* (Path/Combine *project-root* (:target-path proj)))
-        (reset! *project* proj))
-      (println "project.clj not found"))))
+  (or
+   (read-project-file (Path/Combine *project-root* "clr-project.clj"))
+   (read-project-file (Path/Combine *project-root* "project.clj"))
+   (println "project.clj or clr-project.clj not found")))
 
 (defn load-dependency [path]
   (let [filename (Path/GetFileName path)
@@ -159,7 +212,7 @@
     (load-dependency dep-path)))
 
 (defn bootstrap-project []
-  (let [{:keys [gac-dependencies local-dependencies source-paths dependencies] :as proj} @*project*]
+  (let [{:keys [gac-dependencies local-dependencies source-paths dependencies package-sources] :as proj} @*project*]
     (add-to-load-path source-paths)
     (install-dependencies dependencies)
     (load-dependencies)
@@ -243,7 +296,7 @@
         gen-context-type (.GetType clj-asm "clojure.lang.CljCompiler.Ast.GenContext")
         files (flatten (for [path source-paths] (get-clj-files path)))
         ext (get-target-ext target)
-        asm-name (AssemblyName. (str name ", Version=" version))
+        asm-name (AssemblyName. name)
         ;; create-with-ext-asm-method
         ;; (.GetMethod gen-context-type "CreateWithExternalAssembly"
         ;;             (emit/type-array String String Boolean))
@@ -256,6 +309,7 @@
         ;;                                             String String
         ;;                                             String))
         ]
+    (set! (.Version asm-name) (Version. version))
     (when key-file
       (set! (.KeyPair asm-name) (signing/create-strong-name-key-pair key-file)))
     (let [gen-ctxt (GenContext/CreateWithExternalAssembly (.Name asm-name) asm-name ext true)]
@@ -408,23 +462,3 @@
   (require 'clojure.main)
   (bootstrap-project)
   (apply clojure.main/main args))
-
-(defn main [& args]
-  (try
-    (binding [*project-root* (or *project-root* (Directory/GetCurrentDirectory))
-              *project* (atom nil)
-              *compile-path* nil]
-      (when (load-project)
-        (let [nargs (count args)]
-          (cond
-           (= 0 args)
-           (println "NLeiningen Preview. Tasks: repl, compile")
-           :default
-           (case (first args)
-             "repl" (start-repl (rest args))
-             "compile" (compile-project)
-             (args-error args)))))
-      0)
-    (catch Exception ex
-               (println "Error: " ex)
-               -1)))

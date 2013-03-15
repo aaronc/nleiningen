@@ -3,5 +3,5 @@
                 ["NuGet.Core"]]
   :local-dependencies
   ["ClojureClrEx"]
- :main "nleiningen.core/main"
+ :main "nleiningen.main/main"
  :target :console }
