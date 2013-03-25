@@ -103,11 +103,18 @@
     (.CopyTo stream mem)
     (.ToArray mem)))
 
-;;(defn- clj-init-type-name [asm-name] (str (clojure.lang.Compiler/munge asm-name) "__$Clj$Init$__"))
-(def ^:private ^:const clj-init-type-name "__$Clj$Init$__")
+(defn- clj-init-type-name [asm-or-name]
+  (let [asm-name (cond (instance? Assembly asm-or-name)
+                       (.. asm-or-name GetName Name)
+                       (instance? AssemblyName asm-or-name)
+                       (.Name asm-or-name)
+                       :default
+                       asm-or-name)]
+    (str (clojure.lang.Compiler/munge asm-name) ".ClojureInit")))
+;;(def ^:private ^:const clj-init-type-name "__$Clj$Init$__")
 
 (defn invoke-asm-load-hooks [asm]
-  (when-let [init-type (.GetType asm clj-init-type-name)]
+  (when-let [init-type (.GetType asm (clj-init-type-name asm))]
     (let [init-method (.GetMethod init-type "Init")]
       (.Invoke init-method nil nil))))
 
@@ -326,7 +333,7 @@
           ;;(.Invoke compile-method nil (emit/obj-array gen-ctxt rdr nil
                                         ;name rel-path))
           ))
-      (let [clj-init-type (emit/clr-type* gen-ctxt clj-init-type-name)
+      (let [clj-init-type (emit/clr-type* gen-ctxt (clj-init-type-name name))
             clj-init (emit/clr-method* clj-init-type "Init" [:Public :Static] nil nil)
             ilg (.GetILGenerator clj-init)
             asm-load-method (.GetMethod Assembly "Load" (emit/type-array String))]
@@ -337,7 +344,7 @@
             (op :Pop))
           (doseq [[name {:keys [path asm asm-name]}] computed-dependencies]
             (println "Computed dependency:" path)
-            (let [init (when asm (.GetType asm clj-init-type-name))]
+            (let [init (when asm (.GetType asm (clj-init-type-name asm)))]
               (if init
                 (let [init-method (.GetMethod init "Init")]
                   (op :Call init-method))

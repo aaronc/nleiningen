@@ -11,5 +11,5 @@
         proj @core/*project*
         id (:name proj)]
     (set! (.Id pg) id)
-    (println id)
+    (println proj)
     (.Save pg (FileStream. (Path/Combine core/*project-root* (str id ".nuspec")) FileMode/OpenOrCreate))))
