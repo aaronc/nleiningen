@@ -4,11 +4,16 @@
   (:require
    [clojure.string :as str]
    [clojure.clr.emit :as emit]
+   [clojure.clr.io :as io]
    [nleiningen.signing :as signing])
   (:import
-   [System.IO Path Directory SearchOption DirectoryInfo StreamReader File TextReader]
-   [System.Reflection Assembly BindingFlags AssemblyName]
-   [System.Reflection.Emit OpCodes PEFileKinds]
+   [System.IO Path Directory SearchOption DirectoryInfo StreamReader File TextReader
+    FileMode FileShare FileAccess MemoryStream]
+   [System.Reflection Assembly BindingFlags AssemblyName
+    AssemblyFileVersionAttribute AssemblyInformationalVersionAttribute
+    AssemblyTitleAttribute AssemblyDescriptionAttribute
+    ResourceAttributes]
+   [System.Reflection.Emit OpCodes PEFileKinds CustomAttributeBuilder]
    [NuGet PackageRepositoryFactory SemanticVersion PackageManager
     PackageOperationEventArgs]
    [clojure.lang.CljCompiler.Ast GenContext]
@@ -295,15 +300,66 @@
     (catch Exception ex
       (println "Error while trying to copy" asm-name "." ex))))
 
+(let [is-compiling-field (.GetField clojure.lang.Compiler "CompilerActiveVar" (enum-or BindingFlags/Static BindingFlags/NonPublic BindingFlags/Public))]
+  (def is-compiling-var (.GetValue is-compiling-field nil)))
+
+;; From bultitude.core
+(defn- read-ns-form
+  "Given a reader on a Clojure source file, read until an ns form is found."
+  [rdr]
+  (let [form (try
+               (binding [*read-eval* false]
+                 (read rdr false ::done))
+                  (catch Exception e ::done))]
+    (if (try
+          (and (list? form) (= 'ns (first form)))
+          (catch Exception _))
+      (try
+        (str form) ;; force the read to read the whole form, throwing on error
+        (second form)
+        (catch Exception _))
+      (when-not (= ::done form)
+        (recur rdr)))))
+
+;; From bultitude.core
+(defn- ns-form-for-file [file]
+  (with-open [r (clojure.lang.PushbackTextReader. (io/text-reader file))]
+    (read-ns-form r)))
+
+(defn- date-time-stamp [now]
+  (format "%04d%02d%02d%02d%02d" (.Year now) (.Month now) (.Day now) (.Hour now) (.Minute now)))
+
+(defn- date-time-version [now]
+  (format "%04d.%02d.%02d.%02d%02d" (.Year now) (.Month now) (.Day now) (.Hour now) (.Minute now)))
+
+(defn- set-custom-attr [target attr-type ctr-param-types ctr-params]
+  (let [ctr (.GetConstructor attr-type (into-array Type ctr-param-types))
+        attr-builder (CustomAttributeBuilder. ctr (into-array Object ctr-params))]
+    (.SetCustomAttribute target attr-builder)
+    attr-builder))
+
+(defn add-as-embedded-resource
+  [mod-builder embedded-filename bytes]
+  (let [mem-stream (MemoryStream. bytes)]
+    (.DefineManifestResource mod-builder
+                             embedded-filename
+                             mem-stream
+                             ResourceAttributes/Public)))
+
 (defn compile-project [& {:keys [clojure-dll]}]
   (bootstrap-project)
   (println "Compile path:" *compile-path*)
-  (let [{:keys [name source-paths computed-dependencies gac-dependencies main target version key-file] :as proj} @*project*
+  (let [{:keys [name description source-paths computed-dependencies gac-dependencies main target version key-file
+                disable-default-aot dll-exclusions] :as proj} @*project*
         clj-asm (or clojure-dll (assembly-load "Clojure"))
         gen-context-type (.GetType clj-asm "clojure.lang.CljCompiler.Ast.GenContext")
         files (flatten (for [path source-paths] (get-clj-files path)))
         ext (get-target-ext target)
         asm-name (AssemblyName. name)
+        now (DateTime/Now)
+        version (.Replace version "*" (date-time-stamp now))
+        sem-ver (SemanticVersion. version)
+        asm-ver (.Version sem-ver)
         ;; create-with-ext-asm-method
         ;; (.GetMethod gen-context-type "CreateWithExternalAssembly"
         ;;             (emit/type-array String String Boolean))
@@ -316,23 +372,63 @@
         ;;                                             String String
         ;;                                             String))
         ]
-    (set! (.Version asm-name) (Version. version))
+    (set! (.Version asm-name) asm-ver)
     (when key-file
       (set! (.KeyPair asm-name) (signing/create-strong-name-key-pair key-file)))
-    (let [gen-ctxt (GenContext/CreateWithExternalAssembly (.Name asm-name) asm-name ext true)]
+    (let [gen-ctxt (GenContext/CreateWithExternalAssembly (.Name asm-name) asm-name ext true)
+          asm-builder (.AssemblyBuilder gen-ctxt)
+          mod-builder (.ModuleBuilder gen-ctxt)]
       (when (not (Directory/Exists *compile-path*))
         (println "Creating" *compile-path*)
         (Directory/CreateDirectory *compile-path*))
-      
-      (doseq [{:keys [rel-path path name]} files]
-        (assert (.EndsWith rel-path ".clj"))
-        (clojure.lang.RT/load  (.Substring rel-path 0 (- (.Length rel-path) 4)))
-        (with-open [rdr (StreamReader. path)]
-          (clojure.lang.Compiler/Compile gen-ctxt rdr nil name
-                                         rel-path)
-          ;;(.Invoke compile-method nil (emit/obj-array gen-ctxt rdr nil
+      (set-custom-attr asm-builder
+                       AssemblyFileVersionAttribute
+                       [String]
+                       [(date-time-version now)])
+      (set-custom-attr asm-builder
+                       AssemblyInformationalVersionAttribute
+                       [String]
+                       [version])
+      (set-custom-attr asm-builder
+                       AssemblyTitleAttribute
+                       [String]
+                       [name])
+      (when description
+        (set-custom-attr asm-builder
+                         AssemblyDescriptionAttribute
+                         [String]
+                         [description]))
+      (try
+        (clojure.lang.Var/pushThreadBindings
+         {emit/cur-gen-context-var gen-ctxt
+          is-compiling-var true})
+        (doseq [{:keys [rel-path path name]} files]
+          (assert (.EndsWith rel-path ".clj"))
+          ;;  (clojure.lang.RT/load  (.Substring rel-path 0 (- (.Length rel-path) 4)))
+          (when-let [ns-name (ns-form-for-file path)]
+            (when-not (some #(re-matches % rel-path) dll-exclusions)
+              (try
+                (if disable-default-aot
+                  (do
+                    (add-as-embedded-resource
+                     mod-builder
+                     (str ns-name ".clj")
+                     (File/ReadAllBytes path))
+                    (println "Embedded" ns-name))
+                  (do
+                    (compile (symbol ns-name))
+                    (println "AOT compiled" ns-name)))
+                (catch Exception ex
+                  (println "Error compiling" path)
+                  (throw ex)))))
+          (comment
+            (with-open [rdr (StreamReader. path)]
+              ;;(clojure.lang.Compiler/Compile gen-ctxt rdr nil name rel-path)
+              ;;(.Invoke compile-method nil (emit/obj-array gen-ctxt rdr nil
                                         ;name rel-path))
-          ))
+              )))
+        (finally
+          (clojure.lang.Var/popThreadBindings)))
       (let [clj-init-type (emit/clr-type* gen-ctxt (clj-init-type-name name))
             clj-init (emit/clr-method* clj-init-type "Init" [:Public :Static] nil nil)
             ilg (.GetILGenerator clj-init)
@@ -343,7 +439,6 @@
             (op :Call asm-load-method)
             (op :Pop))
           (doseq [[name {:keys [path asm asm-name]}] computed-dependencies]
-            (println "Computed dependency:" path)
             (let [init (when asm (.GetType asm (clj-init-type-name asm)))]
               (if init
                 (let [init-method (.GetMethod init "Init")]
@@ -417,8 +512,8 @@
                                 (case target
                                   :console PEFileKinds/ConsoleApplication
                                   :windows PEFileKinds/WindowApplication
-                                  PEFileKinds/Dll)))))
-          (println "Saving" (str name ext))
+                                  PEFileKinds/Dll))))
+            (println "Saving" (str name ext)))
           (.Invoke (.GetMethod GenContext "SaveAssembly" (enum-or BindingFlags/Instance BindingFlags/NonPublic)) gen-ctxt nil)
           (let [copied-refs (atom #{})
                 asm-builder (.. gen-ctxt AssemblyGen AssemblyBuilder)]
