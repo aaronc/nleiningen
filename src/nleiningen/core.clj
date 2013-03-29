@@ -412,7 +412,7 @@
                   (do
                     (add-as-embedded-resource
                      mod-builder
-                     (str ns-name ".clj")
+                     (str (.Replace (str ns-name) "-" "_") ".clj")
                      (File/ReadAllBytes path))
                     (println "Embedded" ns-name))
                   (do
